@@ -1,0 +1,25 @@
+services:
+  openvas-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: astropema/openvas-dashboard:latest
+    container_name: openvas-dashboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9393:80"
+    volumes:
+      # Mount gvmd socket read/write
+      - /run/gvmd/gvmd.sock:/run/gvmd/gvmd.sock
+    environment:
+      - GVM_USER=admin
+      - GVM_PASS=${GVM_PASS}          # set in .env file — never hardcode
+    # Give container access to the _gvm group socket
+    # User inside container must be in a group that matches socket GID
+    # See README: socket-perms systemd override required
+    networks:
+      - openvas-net
+
+networks:
+  openvas-net:
+    driver: bridge
