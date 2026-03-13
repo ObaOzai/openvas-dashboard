@@ -11,6 +11,13 @@ define('GVM_PASS',   getenv('GVM_PASS')   ?: '');
 define('CACHE_FILE', '/tmp/gvm_cache.json');
 define('CACHE_TTL',  120); // seconds
 
+// Cache flush
+if (isset($_GET['flush']) && file_exists(CACHE_FILE)) {
+    unlink(CACHE_FILE);
+    header('Location: /');
+    exit;
+}
+
 // ─── GMP Client ────────────────────────────────────────────────────────────
 
 class GmpClient {
@@ -746,14 +753,6 @@ elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $ris
   <a href="?flush=1" style="color:var(--muted);text-decoration:none">flush cache</a>
 </footer>
 
-<?php
-// Cache flush
-if (isset($_GET['flush']) && file_exists(CACHE_FILE)) {
-    unlink(CACHE_FILE);
-    header('Location: /');
-    exit;
-}
-?>
 
 </body>
 </html>
