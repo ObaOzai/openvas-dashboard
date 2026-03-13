@@ -1,7 +1,7 @@
 <?php
 /**
  * OpenVAS / GVM Dashboard
- * JD Correa-Landreau AstroPema AI LLC | mail.astropema.ai
+ * AstroPema AI LLC | JD Correa-Landreau 
  * Communicates with gvmd via GMP XML protocol over Unix socket
  */
 
@@ -11,7 +11,7 @@ define('GVM_PASS',   getenv('GVM_PASS')   ?: '');
 define('CACHE_FILE', '/tmp/gvm_cache.json');
 define('CACHE_TTL',  120); // seconds
 
-// Cache flush
+// Cache flush — must be before any output
 if (isset($_GET['flush']) && file_exists(CACHE_FILE)) {
     unlink(CACHE_FILE);
     header('Location: /');
@@ -29,7 +29,6 @@ class GmpClient {
         $this->socket = @stream_socket_client('unix://' . GVM_SOCKET, $errno, $errstr, 10);
         if (!$this->socket) return false;
         stream_set_timeout($this->socket, 15);
-        // read banner
         $this->read();
         return true;
     }
@@ -57,7 +56,6 @@ class GmpClient {
             $chunk = fread($this->socket, 65536);
             if ($chunk === false) break;
             $buf .= $chunk;
-            // stop when we have a complete XML response
             if ($buf && $this->isComplete($buf)) break;
             if (microtime(true) - $start > 15) break;
             if (!strlen($chunk)) usleep(10000);
@@ -66,7 +64,6 @@ class GmpClient {
     }
 
     private function isComplete(string $xml): bool {
-        // Heuristic: balanced root element
         libxml_use_internal_errors(true);
         $doc = @simplexml_load_string($xml);
         return $doc !== false;
@@ -80,7 +77,6 @@ class GmpClient {
 // ─── Data Collection ────────────────────────────────────────────────────────
 
 function fetch_gvm_data(): array {
-    // Return cached if fresh
     if (file_exists(CACHE_FILE)) {
         $cached = json_decode(file_get_contents(CACHE_FILE), true);
         if ($cached && (time() - ($cached['ts'] ?? 0)) < CACHE_TTL) {
@@ -89,15 +85,16 @@ function fetch_gvm_data(): array {
     }
 
     $data = [
-        'ts'            => time(),
-        'connected'     => false,
-        'error'         => null,
-        'tasks'         => [],
+        'ts'                  => time(),
+        'connected'           => false,
+        'error'               => null,
+        'tasks'               => [],
         'results_by_severity' => ['Critical'=>0,'High'=>0,'Medium'=>0,'Low'=>0,'Log'=>0],
-        'top_hosts'     => [],
-        'last_scan'     => null,
-        'total_results' => 0,
-        'nvt_count'     => 0,
+        'results_detail'      => [],   // full per-finding list for drill-down
+        'top_hosts'           => [],
+        'last_scan'           => null,
+        'total_results'       => 0,
+        'nvt_count'           => 0,
     ];
 
     $gmp = new GmpClient();
@@ -129,13 +126,13 @@ function fetch_gvm_data(): array {
                     $last_run    = (string)($lr->timestamp ?? '');
                 }
                 $data['tasks'][] = [
-                    'id'          => (string)$task['id'],
-                    'name'        => (string)$task->name,
-                    'status'      => (string)$task->status,
-                    'progress'    => (int)$task->progress,
-                    'last_report' => $last_report,
-                    'last_run'    => $last_run,
-                    'result_count'=> (int)($task->result_count->full ?? 0),
+                    'id'           => (string)$task['id'],
+                    'name'         => (string)$task->name,
+                    'status'       => (string)$task->status,
+                    'progress'     => (int)$task->progress,
+                    'last_report'  => $last_report,
+                    'last_run'     => $last_run,
+                    'result_count' => (int)($task->result_count->full ?? 0),
                 ];
                 if ($last_run) {
                     if (!$data['last_scan'] || $last_run > $data['last_scan']) {
@@ -146,22 +143,41 @@ function fetch_gvm_data(): array {
         }
     }
 
-    // ── Results summary (severity counts) ──
-    $resp = $gmp->send('<get_results filter="rows=500 sort-reverse=date"/>');
+    // ── Results — fetch full detail for drill-down ──
+    $resp = $gmp->send('<get_results filter="rows=1000 sort-reverse=severity"/>');
     if ($resp) {
         libxml_use_internal_errors(true);
         $xml = @simplexml_load_string($resp);
         if ($xml) {
             $host_counts = [];
             foreach ($xml->result as $result) {
-                $sev = (float)($result->severity ?? 0);
-                $host = trim((string)($result->host ?? ''));
-                if ($sev >= 9.0)      $data['results_by_severity']['Critical']++;
-                elseif ($sev >= 7.0)  $data['results_by_severity']['High']++;
-                elseif ($sev >= 4.0)  $data['results_by_severity']['Medium']++;
-                elseif ($sev > 0.0)   $data['results_by_severity']['Low']++;
-                else                  $data['results_by_severity']['Log']++;
+                $sev   = (float)($result->severity ?? 0);
+                $host  = trim((string)($result->host ?? ''));
+                $port  = trim((string)($result->port ?? ''));
+                $name  = trim((string)($result->name ?? ''));
+                $desc  = trim((string)($result->description ?? ''));
+
+                if ($sev >= 9.0)      $bucket = 'Critical';
+                elseif ($sev >= 7.0)  $bucket = 'High';
+                elseif ($sev >= 4.0)  $bucket = 'Medium';
+                elseif ($sev > 0.0)   $bucket = 'Low';
+                else                  $bucket = 'Log';
+
+                $data['results_by_severity'][$bucket]++;
                 $data['total_results']++;
+
+                // Store for drill-down (cap at 200 per bucket to keep cache sane)
+                if (!isset($data['results_detail'][$bucket])) $data['results_detail'][$bucket] = [];
+                if (count($data['results_detail'][$bucket]) < 200) {
+                    $data['results_detail'][$bucket][] = [
+                        'name' => $name ?: '(unnamed)',
+                        'host' => $host ?: '—',
+                        'port' => $port ?: '—',
+                        'sev'  => $sev,
+                        'desc' => mb_substr($desc, 0, 300),
+                    ];
+                }
+
                 if ($host) {
                     $host_counts[$host] = ($host_counts[$host] ?? 0) + 1;
                 }
@@ -182,7 +198,6 @@ function fetch_gvm_data(): array {
     }
 
     $gmp->close();
-
     file_put_contents(CACHE_FILE, json_encode($data));
     return $data;
 }
@@ -232,6 +247,9 @@ if ($d['results_by_severity']['Critical'] > 0) { $risk_level = 'CRITICAL'; $risk
 elseif ($d['results_by_severity']['High'] > 0)  { $risk_level = 'HIGH';     $risk_color = '#ff7c2a'; }
 elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $risk_color = '#f5c518'; }
 
+// Pass drill-down data to JS
+$drill_json = json_encode($d['results_detail'] ?? [], JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT);
+
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -267,7 +285,6 @@ elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $ris
     padding: 0;
   }
 
-  /* Scanline overlay */
   body::before {
     content: '';
     position: fixed; inset: 0;
@@ -287,9 +304,7 @@ elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $ris
     position: sticky; top: 0; z-index: 50;
   }
 
-  .logo {
-    display: flex; align-items: center; gap: 14px;
-  }
+  .logo { display: flex; align-items: center; gap: 14px; }
 
   .logo-mark {
     width: 36px; height: 36px;
@@ -304,30 +319,22 @@ elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $ris
   }
 
   .logo-text {
-    font-size: 15px;
-    font-weight: 600;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    color: #e0e8f0;
+    font-size: 15px; font-weight: 600;
+    letter-spacing: 2px; text-transform: uppercase; color: #e0e8f0;
   }
 
   .logo-sub {
-    font-size: 11px;
-    color: var(--muted);
-    letter-spacing: 1px;
-    font-family: var(--mono);
+    font-size: 11px; color: var(--muted);
+    letter-spacing: 1px; font-family: var(--mono);
   }
 
   .header-right {
     display: flex; align-items: center; gap: 24px;
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--muted);
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
   }
 
   .status-dot {
-    display: inline-block;
-    width: 7px; height: 7px;
+    display: inline-block; width: 7px; height: 7px;
     border-radius: 50%;
     background: <?= $d['connected'] ? '#00ff88' : '#ff3b3b' ?>;
     box-shadow: 0 0 6px <?= $d['connected'] ? '#00ff88' : '#ff3b3b' ?>;
@@ -335,239 +342,224 @@ elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $ris
     animation: pulse 2s ease-in-out infinite;
   }
 
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: .4; }
-  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 
   .risk-badge {
     padding: 4px 12px;
     border: 1px solid var(--risk);
     border-radius: 3px;
     color: var(--risk);
-    font-weight: 700;
-    font-size: 11px;
-    letter-spacing: 2px;
+    font-weight: 700; font-size: 11px; letter-spacing: 2px;
     text-shadow: 0 0 8px var(--risk);
     box-shadow: 0 0 12px rgba(255,59,59,.1);
   }
 
-  /* Layout */
-  main {
-    max-width: 1400px;
-    margin: 0 auto;
-    padding: 28px 32px;
-  }
+  main { max-width: 1400px; margin: 0 auto; padding: 28px 32px; }
 
-  /* Error banner */
   .error-banner {
     background: rgba(255,59,59,.08);
     border: 1px solid rgba(255,59,59,.3);
-    border-radius: 4px;
-    padding: 16px 20px;
-    margin-bottom: 24px;
-    font-family: var(--mono);
-    font-size: 13px;
-    color: #ff8080;
+    border-radius: 4px; padding: 16px 20px; margin-bottom: 24px;
+    font-family: var(--mono); font-size: 13px; color: #ff8080;
   }
 
-  /* Stat cards row */
+  /* Stat cards */
   .stat-row {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 16px;
-    margin-bottom: 28px;
+    gap: 16px; margin-bottom: 28px;
   }
 
   .stat-card {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 20px 20px 16px;
-    position: relative;
-    overflow: hidden;
-    transition: border-color .2s;
+    border-radius: 4px; padding: 20px 20px 16px;
+    position: relative; overflow: hidden;
+    transition: border-color .2s, transform .15s, box-shadow .2s;
+  }
+
+  .stat-card.clickable {
+    cursor: pointer;
+  }
+
+  .stat-card.clickable:hover {
+    border-color: var(--card-accent, var(--accent));
+    transform: translateY(-2px);
+    box-shadow: 0 4px 20px rgba(0,212,255,.08);
+  }
+
+  .stat-card.clickable:hover .stat-value {
+    text-shadow: 0 0 30px var(--card-accent, rgba(0,212,255,.5));
   }
 
   .stat-card::before {
     content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 2px;
+    position: absolute; top: 0; left: 0; right: 0; height: 2px;
     background: var(--card-accent, var(--accent));
   }
 
-  .stat-card:hover { border-color: var(--accent); }
+  .stat-card .drill-hint {
+    position: absolute; bottom: 8px; right: 10px;
+    font-family: var(--mono); font-size: 9px; color: var(--muted);
+    letter-spacing: 1px; opacity: 0;
+    transition: opacity .2s;
+  }
+
+  .stat-card.clickable:hover .drill-hint { opacity: 1; }
 
   .stat-label {
-    font-size: 10px;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    color: var(--muted);
-    font-family: var(--mono);
-    margin-bottom: 10px;
+    font-size: 10px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--muted); font-family: var(--mono); margin-bottom: 10px;
   }
 
   .stat-value {
-    font-size: 36px;
-    font-weight: 700;
-    line-height: 1;
+    font-size: 36px; font-weight: 700; line-height: 1;
     color: var(--card-accent, var(--accent));
     text-shadow: 0 0 20px var(--card-accent, rgba(0,212,255,.3));
     font-family: var(--mono);
+    transition: text-shadow .2s;
   }
 
   .stat-sub {
-    font-size: 11px;
-    color: var(--muted);
-    margin-top: 6px;
-    font-family: var(--mono);
+    font-size: 11px; color: var(--muted); margin-top: 6px; font-family: var(--mono);
   }
 
-  /* Two-column grid */
-  .grid-2 {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 20px;
-    margin-bottom: 28px;
-  }
-
+  /* Grid */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 28px; }
   @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
 
   /* Panel */
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    overflow: hidden;
-  }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
 
   .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 14px 20px;
-    border-bottom: 1px solid var(--border);
-    font-size: 10px;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    color: var(--muted);
-    font-family: var(--mono);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    font-size: 10px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--muted); font-family: var(--mono);
   }
 
-  .panel-header .count {
-    color: var(--accent);
-    font-weight: 700;
-  }
+  .panel-header .count { color: var(--accent); font-weight: 700; }
 
   /* Severity bars */
   .sev-list { padding: 16px 20px; }
 
-  .sev-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 14px;
-  }
+  .sev-row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
 
-  .sev-label {
-    font-family: var(--mono);
-    font-size: 11px;
-    width: 65px;
-    color: var(--text);
-    flex-shrink: 0;
-  }
+  .sev-label { font-family: var(--mono); font-size: 11px; width: 65px; color: var(--text); flex-shrink: 0; }
 
-  .sev-bar-wrap {
-    flex: 1;
-    height: 6px;
-    background: rgba(255,255,255,.04);
-    border-radius: 3px;
-    overflow: hidden;
-  }
+  .sev-bar-wrap { flex: 1; height: 6px; background: rgba(255,255,255,.04); border-radius: 3px; overflow: hidden; }
 
-  .sev-bar {
-    height: 100%;
-    border-radius: 3px;
-    transition: width .6s cubic-bezier(.22,1,.36,1);
-  }
+  .sev-bar { height: 100%; border-radius: 3px; transition: width .6s cubic-bezier(.22,1,.36,1); }
 
-  .sev-count {
-    font-family: var(--mono);
-    font-size: 12px;
-    width: 36px;
-    text-align: right;
-    flex-shrink: 0;
-  }
+  .sev-count { font-family: var(--mono); font-size: 12px; width: 36px; text-align: right; flex-shrink: 0; }
 
   /* Host table */
   .host-table { width: 100%; border-collapse: collapse; }
   .host-table th {
-    text-align: left;
-    padding: 8px 20px;
-    font-size: 10px;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-weight: 400;
+    text-align: left; padding: 8px 20px;
+    font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase;
+    color: var(--muted); font-family: var(--mono); font-weight: 400;
   }
-  .host-table td {
-    padding: 9px 20px;
-    font-family: var(--mono);
-    font-size: 12px;
-    border-top: 1px solid rgba(255,255,255,.03);
-  }
+  .host-table td { padding: 9px 20px; font-family: var(--mono); font-size: 12px; border-top: 1px solid rgba(255,255,255,.03); }
   .host-table tr:hover td { background: rgba(0,212,255,.03); }
   .host-bar-cell { width: 40%; }
-  .host-bar-wrap {
-    height: 4px;
-    background: rgba(255,255,255,.04);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-  .host-bar {
-    height: 100%;
-    background: linear-gradient(90deg, var(--accent2), var(--accent));
-    border-radius: 2px;
-  }
+  .host-bar-wrap { height: 4px; background: rgba(255,255,255,.04); border-radius: 2px; overflow: hidden; }
+  .host-bar { height: 100%; background: linear-gradient(90deg, var(--accent2), var(--accent)); border-radius: 2px; }
 
   /* Tasks table */
   .tasks-wrap { overflow-x: auto; }
   .tasks-table { width: 100%; border-collapse: collapse; }
   .tasks-table th {
-    text-align: left;
-    padding: 10px 16px;
-    font-size: 10px;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-weight: 400;
-    white-space: nowrap;
+    text-align: left; padding: 10px 16px;
+    font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase;
+    color: var(--muted); font-family: var(--mono); font-weight: 400; white-space: nowrap;
   }
-  .tasks-table td {
-    padding: 10px 16px;
-    font-size: 12px;
-    border-top: 1px solid rgba(255,255,255,.03);
-  }
+  .tasks-table td { padding: 10px 16px; font-size: 12px; border-top: 1px solid rgba(255,255,255,.03); }
   .tasks-table tr:hover td { background: rgba(0,212,255,.025); }
   .task-name { font-weight: 600; color: #d0daf0; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-meta { font-family: var(--mono); color: var(--muted); font-size: 11px; }
 
-  /* Progress bar */
   .prog-wrap { width: 80px; height: 4px; background: rgba(255,255,255,.05); border-radius: 2px; display: inline-block; vertical-align: middle; }
   .prog-fill  { height: 100%; background: var(--accent); border-radius: 2px; }
 
   /* Footer */
   footer {
-    text-align: center;
-    padding: 20px 32px;
+    text-align: center; padding: 20px 32px;
+    font-family: var(--mono); font-size: 10px; color: var(--muted);
+    border-top: 1px solid var(--border); margin-top: 12px;
+  }
+
+  /* ── Modal ── */
+  .modal-overlay {
+    display: none;
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,.75);
+    backdrop-filter: blur(3px);
+    align-items: flex-start;
+    justify-content: center;
+    padding: 40px 20px;
+    overflow-y: auto;
+  }
+
+  .modal-overlay.open { display: flex; }
+
+  .modal {
+    background: #0d1220;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    width: 100%; max-width: 900px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.6);
+    animation: slideIn .2s ease;
+  }
+
+  @keyframes slideIn { from { opacity:0; transform:translateY(-16px); } to { opacity:1; transform:none; } }
+
+  .modal-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
     font-family: var(--mono);
-    font-size: 10px;
-    color: var(--muted);
-    border-top: 1px solid var(--border);
-    margin-top: 12px;
+  }
+
+  .modal-title {
+    font-size: 13px; letter-spacing: 2px; text-transform: uppercase;
+  }
+
+  .modal-close {
+    background: none; border: none; color: var(--muted);
+    font-size: 20px; cursor: pointer; line-height: 1;
+    padding: 0 4px;
+    transition: color .15s;
+  }
+  .modal-close:hover { color: #fff; }
+
+  .modal-body { padding: 0; max-height: 70vh; overflow-y: auto; }
+
+  /* Findings table */
+  .findings-table { width: 100%; border-collapse: collapse; }
+  .findings-table th {
+    position: sticky; top: 0;
+    background: #0a0c14;
+    text-align: left; padding: 10px 16px;
+    font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase;
+    color: var(--muted); font-family: var(--mono); font-weight: 400;
+    border-bottom: 1px solid var(--border);
+  }
+  .findings-table td {
+    padding: 10px 16px; font-size: 12px;
+    border-top: 1px solid rgba(255,255,255,.03);
+    vertical-align: top;
+  }
+  .findings-table tr:hover td { background: rgba(0,212,255,.025); }
+  .finding-name { font-weight: 600; color: #d0daf0; font-size: 12px; }
+  .finding-desc { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
+  .finding-host { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+  .finding-port { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .finding-sev  { font-family: var(--mono); font-size: 12px; font-weight: 700; }
+
+  .modal-empty {
+    padding: 40px; text-align: center;
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
   }
 </style>
 </head>
@@ -596,36 +588,35 @@ elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $ris
 
 <!-- Stat cards -->
 <div class="stat-row">
-  <div class="stat-card" style="--card-accent:#ff3b3b">
-    <div class="stat-label">Critical</div>
-    <div class="stat-value"><?= $d['results_by_severity']['Critical'] ?></div>
-    <div class="stat-sub">CVSS ≥ 9.0</div>
+  <?php
+  $sev_cards = [
+    'Critical' => ['color' => '#ff3b3b', 'range' => 'CVSS ≥ 9.0'],
+    'High'     => ['color' => '#ff7c2a', 'range' => 'CVSS 7.0–8.9'],
+    'Medium'   => ['color' => '#f5c518', 'range' => 'CVSS 4.0–6.9'],
+    'Low'      => ['color' => '#4fc3f7', 'range' => 'CVSS 0.1–3.9'],
+    'Log'      => ['color' => '#78909c', 'range' => 'CVSS 0.0'],
+  ];
+  foreach ($sev_cards as $sev => $meta):
+    $count = $d['results_by_severity'][$sev];
+    $clickable = $count > 0 ? 'clickable' : '';
+  ?>
+  <div class="stat-card <?= $clickable ?>" style="--card-accent:<?= $meta['color'] ?>"
+    <?= $clickable ? "onclick=\"openDrill('".htmlspecialchars($sev)."')\" title=\"Click to view findings\"" : '' ?>>
+    <div class="stat-label"><?= $sev ?></div>
+    <div class="stat-value"><?= $count ?></div>
+    <div class="stat-sub"><?= $meta['range'] ?></div>
+    <?php if ($clickable): ?>
+    <div class="drill-hint">▼ VIEW FINDINGS</div>
+    <?php endif; ?>
   </div>
-  <div class="stat-card" style="--card-accent:#ff7c2a">
-    <div class="stat-label">High</div>
-    <div class="stat-value"><?= $d['results_by_severity']['High'] ?></div>
-    <div class="stat-sub">CVSS 7.0–8.9</div>
-  </div>
-  <div class="stat-card" style="--card-accent:#f5c518">
-    <div class="stat-label">Medium</div>
-    <div class="stat-value"><?= $d['results_by_severity']['Medium'] ?></div>
-    <div class="stat-sub">CVSS 4.0–6.9</div>
-  </div>
-  <div class="stat-card" style="--card-accent:#4fc3f7">
-    <div class="stat-label">Low</div>
-    <div class="stat-value"><?= $d['results_by_severity']['Low'] ?></div>
-    <div class="stat-sub">CVSS 0.1–3.9</div>
-  </div>
-  <div class="stat-card" style="--card-accent:#78909c">
-    <div class="stat-label">Log / Info</div>
-    <div class="stat-value"><?= $d['results_by_severity']['Log'] ?></div>
-    <div class="stat-sub">CVSS 0.0</div>
-  </div>
+  <?php endforeach; ?>
+
   <div class="stat-card">
     <div class="stat-label">Tasks</div>
     <div class="stat-value"><?= count($d['tasks']) ?></div>
     <div class="stat-sub"><?= $d['last_scan'] ? 'Last: ' . format_ts($d['last_scan']) : 'No scans yet' ?></div>
   </div>
+
   <?php if ($d['nvt_count']): ?>
   <div class="stat-card" style="--card-accent:#7c4dff">
     <div class="stat-label">NVT Feed</div>
@@ -638,7 +629,6 @@ elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $ris
 <!-- Severity breakdown + Top hosts -->
 <div class="grid-2">
 
-  <!-- Severity bars -->
   <div class="panel">
     <div class="panel-header">
       <span>Severity Breakdown</span>
@@ -667,7 +657,6 @@ elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $ris
     </div>
   </div>
 
-  <!-- Top hosts -->
   <div class="panel">
     <div class="panel-header">
       <span>Top Affected Hosts</span>
@@ -753,6 +742,83 @@ elseif ($d['results_by_severity']['Medium'] > 5) { $risk_level = 'MEDIUM';  $ris
   <a href="?flush=1" style="color:var(--muted);text-decoration:none">flush cache</a>
 </footer>
 
+<!-- ── Drill-down Modal ── -->
+<div class="modal-overlay" id="drillOverlay" onclick="closeDrillOnOverlay(event)">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title" id="drillTitle">Findings</span>
+      <button class="modal-close" onclick="closeDrill()">✕</button>
+    </div>
+    <div class="modal-body" id="drillBody"></div>
+  </div>
+</div>
+
+<script>
+const DRILL = <?= $drill_json ?>;
+
+const SEV_COLOR = {
+  Critical: '#ff3b3b',
+  High:     '#ff7c2a',
+  Medium:   '#f5c518',
+  Low:      '#4fc3f7',
+  Log:      '#78909c',
+};
+
+function openDrill(bucket) {
+  const findings = DRILL[bucket] || [];
+  const color = SEV_COLOR[bucket] || '#aaa';
+
+  document.getElementById('drillTitle').textContent =
+    bucket.toUpperCase() + ' FINDINGS — ' + findings.length + ' result' + (findings.length !== 1 ? 's' : '');
+  document.getElementById('drillTitle').style.color = color;
+
+  const body = document.getElementById('drillBody');
+
+  if (!findings.length) {
+    body.innerHTML = '<div class="modal-empty">No findings in this severity range.</div>';
+  } else {
+    let html = '<table class="findings-table"><thead><tr>'
+      + '<th>#</th><th>Vulnerability</th><th>Host</th><th>Port</th><th>CVSS</th>'
+      + '</tr></thead><tbody>';
+
+    findings.forEach((f, i) => {
+      const desc = f.desc ? `<div class="finding-desc">${escHtml(f.desc.substring(0,200))}${f.desc.length>=200?'…':''}</div>` : '';
+      html += `<tr>
+        <td style="font-family:var(--mono);font-size:11px;color:var(--muted)">${i+1}</td>
+        <td><div class="finding-name">${escHtml(f.name)}</div>${desc}</td>
+        <td><div class="finding-host">${escHtml(f.host)}</div></td>
+        <td><div class="finding-port">${escHtml(f.port)}</div></td>
+        <td><div class="finding-sev" style="color:${color}">${f.sev.toFixed(1)}</div></td>
+      </tr>`;
+    });
+
+    html += '</tbody></table>';
+    body.innerHTML = html;
+  }
+
+  document.getElementById('drillOverlay').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeDrill() {
+  document.getElementById('drillOverlay').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+function closeDrillOnOverlay(e) {
+  if (e.target === document.getElementById('drillOverlay')) closeDrill();
+}
+
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrill(); });
+</script>
 
 </body>
 </html>
